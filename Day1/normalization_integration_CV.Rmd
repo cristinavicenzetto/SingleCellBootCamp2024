@@ -1,0 +1,217 @@
+---
+title: "Normalization and Integration"
+date: "2024-07-23"
+output: 
+  html_notebook:
+    toc: true
+    toc_float: true
+    theme: united
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, comment = "", fig.align = "center", fig.height = 5, fig.width = 7, warning = F)
+knitr::opts_knit$set(root.dir = "/home/lodato/mmiotto/misc/single_cell_bootcamp_unimi/") 
+
+library(Seurat)
+library(SeuratData)
+library(ggplot2)
+```
+
+## Load data
+```{r}
+InstallData("pbmcsca")
+obj <- LoadData("pbmcsca")
+obj
+```
+
+## Basic QC
+We now filter cells with more than 1000 features.
+```{r}
+obj <- subset(obj, nFeature_RNA > 1000)
+obj
+```
+
+The object contains data from nine different batches (stored in the Method column in the object metadata), representing seven different technologies.
+We can see them:
+```{r}
+table(obj$Method)
+```
+
+## Normalization
+The first step after the QC is normalization, to make gene expression comparable between cells. 
+
+As we have multiple batches, we have first to split the object RNA layer into them, and then perform the normalization.
+
+```{r}
+obj[["RNA"]] <- split(obj[["RNA"]], f = obj$Method)
+obj
+```
+
+We can now perform the normalization for each batch with just one line of code:
+se mettiamo dopo obj fra parentesi possiamo scegliere il metodo
+```{r}
+obj <- NormalizeData(obj)
+obj
+```
+This normalization set a scale factor of 10,000 for each cell (so the sum of the counts of a cell is set to 10,000), and adjust the expression value of each gene accordingly. It then calculate the log1p of those values (natural logarithm of the value+1 to account for zeros).
+
+We can confirm that normalization has made the cells expression comparable, we are taking first ten cells for one methods inthe assay rna:
+
+vediamo che le conte sono diverse per i dati perchè i layer raw da conta sbagliata
+```{r}
+apply(obj[["RNA"]]$counts.10x_Chromium_v2[, 1:10], MARGIN = 2, FUN = function(x) {sum(x)})
+```
+visto che la conta è sbagliata, usando il layer data riusciamo ad avere la conta corretta 
+
+```{r}
+apply(obj[["RNA"]]$data.10x_Chromium_v2[, 1:10], MARGIN = 2, FUN = function(x) {sum(exp(x) - 1)})
+```
+
+## Dimensionality reduction
+In order to run the PCA, we have to perform two operations on the data:
+
+* Extrapolate variable features, this analysis only on top 2ooo variabile features, per togliere il rumore di fondo
+* Scale data for those features: when performing PCA, input data should be scaled so that each feature has the same "weight", other wise gene with higher expressionwight more and change the PCA
+
+function findavariable e guardfiamo le prime 10 che sono le clasiche del campione che stiamo valutando
+
+```{r}
+obj <- FindVariableFeatures(obj)
+head(VariableFeatures(obj), 10)
+```
+works only variable featuers e crea la matrice solo sulle 2000 (solo sui top) abbbiamo un layer in più che hale scaled data, quindi matrice con i top 2000 
+```{r}
+obj <- ScaleData(obj)
+obj
+```
+
+### PCA
+npcs quante dimensioni, 
+features = sceglere che features di defolt sceglie hiper variable genes, ma posso scegliere i geni che mi interessanodi più,
+to deal with randomness it is important to set a seed, seraut has its own set =42, ogni volta che si cambia cambiano un pochino
+```{r}
+obj <- RunPCA(obj)
+obj
+
+#per ispezionazionare l'oggetto e vedere come è la variabilità per ogni pc per aiutare la scelta di qunate pc per catturare la varaibiità che mi serve, nella prima riga seleziono quante cellule e pc vedere e poi gli diciamo cosa vedere
+obj@reductions$pca@cell.embedding[1:10, 1:5]
+obj@reductions$pca@stdev
+```
+
+
+
+fare il grouping per le varie covariate che possono creare confusione (cosa può influenzare l'espressione)
+```{r}
+DimPlot(obj, group.by = "Method")
+```
+to select the number of dimension, clustering e umap si usa pca e non the highest variable genes, quindi di usano 15 dim. Fra 15 e 25 vq bene, andaer oltre si aggiunge peso computazionale
+```{r}
+ElbowPlot(obj, ndims = 50) +
+  scale_x_continuous(breaks = seq(0, 50, 5))
+```
+
+
+### UMAP
+To better highlight differences in the sample, we can visualize the data with the UMAP. rinominale sempre perchè se no si sovrascrive
+```{r}
+obj <- RunUMAP(obj, dims = 1:16, reduction = "pca", reduction.name = "umap.unintegrated")
+obj
+```
+
+We can now visualize it: si vedeche ci sono dei cluster in base al confodente che possiamo elencare sotto group by. Qui abbiamo clear batch effect. Si può fare anche per samples, ma dipende da quanti sono i campioni perchè se sono troppi
+```{r}
+DimPlot(obj, reduction = "umap.unintegrated", group.by = c("Method", "Experiment"))
+```
+
+We can see that they clusterize by Method. This data should be integrated, as in scRNA seq experiment the clusters should be celltypes.
+
+## Integration
+To perform the integration of the data, we will use the `IntegrateLayers` funtion whithin Seurat. There are different integration methods: CCA, RPCA, Harmony, FastMNN and scVI. We will show CCA and Harmony.
+rpca e harmony più conservativo
+the function is the same for all the methods and it is based on the layers: it is important to chose which variables (the onethat has to be integrated) to use for the the layers separation. Se ci sono più variabili si può fare un merge 
+
+obj <- IntegrateLayers(
+  object = obj, method = CCAIntegration,
+  orig.reduction = "pca"(si deve scegliere dove integrare e si parte sempre dal pca), new.reduction = "integrated.cca" (con l'integrazione si genera una nuova genrazione),
+  verbose = FALSE
+)
+
+questa nuova integrazione avremo unanew reduction on top of pca da cui si fa l'umap
+
+### CCA
+```{r}
+obj <- IntegrateLayers(
+  object = obj, method = CCAIntegration,
+  orig.reduction = "pca", new.reduction = "integrated.cca",
+  verbose = FALSE
+)
+```
+rinominata la 
+
+```{r}
+obj <- RunUMAP(obj, dims = 1:16, reduction = "integrated.cca", reduction.name = "umap.cca")
+obj
+```
+tutte le tecnologie nei cluster, quindi 
+```{r}
+DimPlot(obj, reduction = "umap.cca", group.by = c("Method"))
+
+#per comparare 
+DimPlot(obj, reduction = "umap.cca", group.by = c("Method")) #aggiungi simbolo sbarretta
+DimPlot(obj, reduction = "umap.cca", group.by = c("Method")) 
+
+```
+
+### Harmony
+```{r}
+obj <- IntegrateLayers(
+  object = obj, method = HarmonyIntegration,
+  orig.reduction = "pca", new.reduction = "integrated.harmony",
+  verbose = FALSE
+)
+```
+
+
+```{r}
+obj <- RunUMAP(obj, dims = 1:16, reduction = "integrated.harmony", reduction.name = "umap.harmony")
+obj
+```
+
+```{r, fig.with=18, fig.high=6}
+DimPlot(obj, reduction = "umap.harmony", group.by = c("Method"))
+```
+
+## Extra: SCTNormalization
+There is also another normalization method in Seurat, which is an upgraded version of NormalizeData: `SCTransform`. It will replace NormalizeData, FindVariableFeatures and ScaleData functions.
+It will introduce a new assay: SCT.
+
+vst.flavour = "v2" si usa la seconda versione
+
+!!! importante in questo caso fare i layer per sample non per il confondente. 
+
+```{r}
+obj <- SCTransform(obj, vst.flavor = "v2")
+obj
+```
+```{r}
+obj <- RunPCA(obj, assay = "SCT", reduction.name = "pca.sct")
+obj <- RunUMAP(obj, dims = 1:16, reduction = "pca.sct", reduction.name = "umap.sct")
+DimPlot(obj, reduction = "umap.sct", group.by = c("Method"))
+```
+sct fa la normalizzazione ma poi si dee fare lo stesso pca e integrazione
+
+```{r}
+obj <- IntegrateLayers(
+  object = obj, method = HarmonyIntegration(),
+  orig.reduction = "pca.sct", new.reduction = "integrated.sct",
+  verbose = FALSE
+)
+```
+
+
+la parte finale per riunire tutti i pacchetti usati per capire la versione
+```{r}
+devtools::session_info()
+```
+
